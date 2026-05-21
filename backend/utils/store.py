@@ -1,8 +1,3 @@
-"""
-In-memory store with thread-safe operations.
-Uses asyncio.Event per call so queue_service can await actual completion.
-"""
-
 import asyncio
 import logging
 from typing import Dict, List, Optional
@@ -20,20 +15,16 @@ class Store:
         self.queue_running: bool = False
 
     def load_candidates(self, candidates: List[Candidate]):
-        # Never reset mid-call
         if self.queue_running:
-            logger.warning("Upload ignored: queue is currently running.")
-            return
+            logger.warning("Upload blocked: queue is running.")
+            raise RuntimeError("Cannot upload while queue is running.")
         self.candidates = candidates
         self.call_sessions.clear()
         self.call_events.clear()
-        logger.info(f"Loaded {len(candidates)} candidates, store reset.")
+        logger.info(f"Loaded {len(candidates)} candidates.")
 
     def get_next_pending(self) -> Optional[Candidate]:
-        for c in self.candidates:
-            if c.status == CallStatus.PENDING:
-                return c
-        return None
+        return next((c for c in self.candidates if c.status == CallStatus.PENDING), None)
 
     def update_candidate_status(self, candidate_id: int, status: CallStatus, **kwargs):
         for c in self.candidates:
@@ -42,11 +33,10 @@ class Store:
                 for k, v in kwargs.items():
                     if hasattr(c, k):
                         setattr(c, k, v)
-                logger.info(f"Candidate {c.name} -> {status.value}")
+                logger.info(f"  {c.name} → {status.value}")
                 break
 
     def update_by_call_sid(self, call_sid: str, **kwargs):
-        """Update candidate fields by call SID."""
         for c in self.candidates:
             if c.call_sid == call_sid:
                 for k, v in kwargs.items():
@@ -58,18 +48,17 @@ class Store:
                         except ValueError:
                             continue
                     setattr(c, k, v)
-                answer_keys = [k for k in kwargs if k not in ("status", "call_duration", "error_message")]
-                if answer_keys:
-                    logger.info(f"Saved answers for {c.name}: {answer_keys}")
+                saved = [k for k in kwargs if k not in ("status", "call_duration", "error_message")]
+                if saved:
+                    logger.info(f"  Answers saved for {c.name}: {saved}")
                 break
 
     def get_by_call_sid(self, call_sid: str) -> Optional[Candidate]:
         return next((c for c in self.candidates if c.call_sid == call_sid), None)
 
     def init_call_session(self, call_sid: str, candidate_name: str, questions: list = None):
-        # Never overwrite an existing active session
         if call_sid in self.call_sessions:
-            logger.warning(f"Session {call_sid} already exists - skipping reinit.")
+            logger.debug(f"Session {call_sid[:16]}... already exists — skipping.")
             return
         from graph.nodes import DEFAULT_SURVEY_QUESTIONS
         self.call_sessions[call_sid] = {
@@ -82,8 +71,10 @@ class Store:
             "silence_retry": 0,
             "identity_retry": 0,
         }
-        self.call_events[call_sid] = asyncio.Event()
-        logger.info(f"Session initialized for {candidate_name} (SID: {call_sid})")
+        # Create event only if not already present
+        if call_sid not in self.call_events:
+            self.call_events[call_sid] = asyncio.Event()
+        logger.info(f"Session ready for {candidate_name}")
 
     def get_session(self, call_sid: str) -> Optional[dict]:
         return self.call_sessions.get(call_sid)
@@ -105,8 +96,7 @@ class Store:
     def get_queue_stats(self) -> dict:
         counts = Counter(c.status for c in self.candidates)
         current = next(
-            (c.name for c in self.candidates if c.status == CallStatus.IN_PROGRESS),
-            None,
+            (c.name for c in self.candidates if c.status == CallStatus.IN_PROGRESS), None
         )
         return {
             "total": len(self.candidates),

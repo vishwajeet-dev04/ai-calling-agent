@@ -1,10 +1,3 @@
-"""
-Queue Service
-=============
-Calls candidates one by one. Uses asyncio.Event to wait for each call
-to truly finish (via the /webhook/call-status callback) instead of polling.
-"""
-
 import asyncio
 import logging
 from models.schemas import CallStatus
@@ -13,8 +6,8 @@ from utils.store import store
 
 logger = logging.getLogger(__name__)
 
-DELAY_BETWEEN_CALLS = 8   # seconds between consecutive calls
-CALL_TIMEOUT = 180        # max seconds to wait for a call to complete
+DELAY_BETWEEN_CALLS = 8
+CALL_TIMEOUT = 300  # 5 minutes max per call
 
 
 async def run_call_queue():
@@ -23,9 +16,8 @@ async def run_call_queue():
 
     while store.queue_running:
         candidate = store.get_next_pending()
-
         if not candidate:
-            logger.info("✓ All candidates processed. Queue complete.")
+            logger.info("✓ All candidates processed.")
             break
 
         logger.info(f"▶ Calling: {candidate.name} ({candidate.phone})")
@@ -33,37 +25,36 @@ async def run_call_queue():
 
         try:
             call_sid = make_call(candidate.phone, candidate.id)
+            # Update candidate with SID BEFORE initializing session
             store.update_candidate_status(candidate.id, CallStatus.IN_PROGRESS, call_sid=call_sid)
+            # Init session AFTER call_sid is linked
             store.init_call_session(call_sid, candidate.name)
             logger.info(f"  SID: {call_sid}")
 
-            # Wait for the call-status webhook to fire (event-based, not polling)
+            # Wait for FINAL call-status (completed/failed/no-answer)
+            # The event is set only by final statuses, not initiated/ringing/in-progress
             event = store.get_call_event(call_sid)
             if event:
                 try:
                     await asyncio.wait_for(event.wait(), timeout=CALL_TIMEOUT)
-                    logger.info(f"  Call completed for {candidate.name}")
+                    logger.info(f"  ✓ Call done: {candidate.name}")
                 except asyncio.TimeoutError:
-                    logger.warning(f"  Timeout waiting for {candidate.name} — marking failed")
-                    store.update_candidate_status(
-                        candidate.id, CallStatus.FAILED,
-                        error_message="Call timed out waiting for status callback"
-                    )
+                    logger.warning(f"  Timeout for {candidate.name}")
+                    store.update_candidate_status(candidate.id, CallStatus.FAILED,
+                                                   error_message="Timed out")
 
         except Exception as e:
-            logger.error(f"  Failed to call {candidate.name}: {e}")
-            store.update_candidate_status(
-                candidate.id, CallStatus.FAILED, error_message=str(e)
-            )
+            logger.error(f"  Error calling {candidate.name}: {e}")
+            store.update_candidate_status(candidate.id, CallStatus.FAILED, error_message=str(e))
 
         if store.queue_running:
-            logger.info(f"  Waiting {DELAY_BETWEEN_CALLS}s before next call...")
+            logger.info(f"  Waiting {DELAY_BETWEEN_CALLS}s...")
             await asyncio.sleep(DELAY_BETWEEN_CALLS)
 
     store.queue_running = False
-    logger.info("═══ Queue runner exited ═══")
+    logger.info("═══ Queue exited ═══")
 
 
 def stop_queue():
     store.queue_running = False
-    logger.info("Queue stop requested.")
+    logger.info("Queue stopped.")
